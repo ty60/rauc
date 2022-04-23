@@ -11,6 +11,9 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 #include "bundle.h"
 #include "bootchooser.h"
@@ -23,6 +26,28 @@
 #include "update_handler.h"
 #include "utils.h"
 #include "mark.h"
+
+#define ARGC 6
+#define RAUC_PATH "/home/ty/work/rauc/rauc"
+#define CERT_PATH "/home/ty/work/rauc/test/fuzz-content/demo.cert.pem"
+// #define BUNDLE_PATH "/tmp/fuzz.raucb"
+#define BUNDLE_PATH "/home/ty/work/rauc/crash.raucb"
+#define LOG_PATH "/tmp/rauc_fuzz.log"
+#define MIN_BUNDLE_SIZE 0x100
+
+
+#ifndef __AFL_FUZZ_TESTCASE_LEN
+  ssize_t fuzz_len;
+  #define __AFL_FUZZ_TESTCASE_LEN fuzz_len
+  unsigned char fuzz_buf[1024000];
+  #define __AFL_FUZZ_TESTCASE_BUF fuzz_buf
+  #define __AFL_FUZZ_INIT() void sync(void);
+  #define __AFL_LOOP(x) ((fuzz_len = read(0, fuzz_buf, sizeof(fuzz_buf))) > 0 ? 1 : 0)
+  #define __AFL_INIT() sync()
+#endif
+
+__AFL_FUZZ_INIT()
+
 
 GMainLoop *r_loop = NULL;
 int r_exit_status = 0;
@@ -186,12 +211,15 @@ static gchar *resolve_bundle_path(char *path)
 	}
 
 	/* If the URI parser returns NULL, assume bundle install with local path */
+    // Ignore bundle check, since fuzzed bundle doesn't exist yet.
+    /*
 	if (bundlescheme == NULL) {
 		if (!g_file_test(bundlelocation, G_FILE_TEST_EXISTS)) {
 			g_printerr("No such file: %s\n", bundlelocation);
 			return NULL;
 		}
 	}
+    */
 
 	return g_steal_pointer(&bundlelocation);
 }
@@ -1083,11 +1111,20 @@ static gchar* info_formatter_json_pretty(RaucManifest *manifest)
 	return info_formatter_json_base(manifest, TRUE);
 }
 
+static void save_fuzzed_bundle(gchar *bundlelocation, unsigned char *fuzzed, size_t len)
+{
+    FILE *fp;
+    fp = fopen((char *)bundlelocation, "w");
+    if (!fp) {
+        return;
+    }
+    fwrite(fuzzed, 1, len, fp);
+    fclose(fp);
+}
+
 static gboolean info_start(int argc, char **argv)
 {
 	g_autofree gchar *bundlelocation = NULL;
-	g_autoptr(RaucManifest) manifest = NULL;
-	g_autoptr(RaucBundle) bundle = NULL;
 	GError *error = NULL;
 	gboolean res = FALSE;
 	gchar* (*formatter)(RaucManifest *manifest) = NULL;
@@ -1129,54 +1166,62 @@ static gboolean info_start(int argc, char **argv)
 	if (no_check_time)
 		check_bundle_params |= CHECK_BUNDLE_NO_CHECK_TIME;
 
-	res = check_bundle(bundlelocation, &bundle, check_bundle_params, &access_args, &error);
-	if (!res) {
-		g_printerr("%s\n", error->message);
-		g_clear_error(&error);
-		goto out;
-	}
+    unsigned char *fuzzed = __AFL_FUZZ_TESTCASE_BUF;
+    while (__AFL_LOOP(10000)) {
+    // while (1) {
+        g_autoptr(RaucManifest) manifest = NULL;
+        g_autoptr(RaucBundle) bundle = NULL;
+        size_t len = __AFL_FUZZ_TESTCASE_LEN;
+        save_fuzzed_bundle(bundlelocation, fuzzed, len);
+        res = check_bundle(bundlelocation, &bundle, check_bundle_params, &access_args, &error);
+        if (!res) {
+            g_printerr("%s\n", error->message);
+            g_clear_error(&error);
+            goto out;
+        }
 
-	if (bundle->manifest) {
-		manifest = g_steal_pointer(&bundle->manifest);
-	} else {
-		res = load_manifest_from_bundle(bundle, &manifest, &error);
-		if (!res) {
-			g_printerr("%s\n", error->message);
-			g_clear_error(&error);
-			goto out;
-		}
-	}
+        if (bundle->manifest) {
+            manifest = g_steal_pointer(&bundle->manifest);
+        } else {
+            res = load_manifest_from_bundle(bundle, &manifest, &error);
+            if (!res) {
+                g_printerr("%s\n", error->message);
+                g_clear_error(&error);
+                goto out;
+            }
+        }
 
-	text = formatter(manifest);
-	g_print("%s\n", text);
-	g_free(text);
+        text = formatter(manifest);
+        g_print("%s\n", text);
+        g_free(text);
 
-	if (info_dumpcert) {
-		text = sigdata_to_string(bundle->sigdata, NULL);
-		g_print("%s\n", text);
-		g_free(text);
-	}
+        if (info_dumpcert) {
+            text = sigdata_to_string(bundle->sigdata, NULL);
+            g_print("%s\n", text);
+            g_free(text);
+        }
 
-	if (info_dumprecipients) {
-		if (!bundle->enveloped_data) {
-			g_print("No recipient data to dump (bundle is not encrypted)\n\n");
-		} else {
-			text = envelopeddata_to_string(bundle->enveloped_data, NULL);
-			g_print("%s\n", text);
-			g_free(text);
-		}
-	}
+        if (info_dumprecipients) {
+            if (!bundle->enveloped_data) {
+                g_print("No recipient data to dump (bundle is not encrypted)\n\n");
+            } else {
+                text = envelopeddata_to_string(bundle->enveloped_data, NULL);
+                g_print("%s\n", text);
+                g_free(text);
+            }
+        }
 
-	if (!output_format || g_strcmp0(output_format, "readable") == 0) {
-		if (!bundle->verified_chain) {
-			g_print("Signature unverified\n");
-			goto out;
-		}
+        if (!output_format || g_strcmp0(output_format, "readable") == 0) {
+            if (!bundle->verified_chain) {
+                g_print("Signature unverified\n");
+                goto out;
+            }
 
-		text = format_cert_chain(bundle->verified_chain);
-		g_print("%s\n", text);
-		g_free(text);
-	}
+            text = format_cert_chain(bundle->verified_chain);
+            g_print("%s\n", text);
+            g_free(text);
+        }
+    }
 
 out:
 	r_exit_status = res ? 0 : 1;
@@ -2366,9 +2411,35 @@ print_help:
 	g_print("%s", text);
 }
 
-int main(int argc, char **argv)
+static void dup_log(void)
+{
+    int fd = open(LOG_PATH, O_WRONLY | O_CREAT, 00664);
+    if (fd < 0) {
+        perror("open");
+        exit(1);
+    }
+    close(1);
+    close(2);
+    dup2(fd, 1);
+    dup2(fd, 2);
+}
+
+int main(void)
 {
 	GLogLevelFlags fatal_mask;
+    int argc = ARGC;
+    const char *argv[ARGC + 1] = {
+        RAUC_PATH,
+        "info",
+        "--no-verify",
+        "--keyring",
+        CERT_PATH,
+        BUNDLE_PATH,
+        NULL,
+    };
+
+    dup_log();
+
 
 #if GLIB_CHECK_VERSION(2, 68, 0)
 	/* To use this function, without bumping the maximum GLib allowed version,

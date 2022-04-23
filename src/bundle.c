@@ -1924,10 +1924,13 @@ gboolean check_bundle(const gchar *bundlename, RaucBundle **bundle, CheckBundleP
 
 			/* the squashfs image size is in ibundle->size */
 			res = cms_verify_fd(fd, ibundle->sigdata, ibundle->size, store, &cms, &ierror);
+            // Neutralize signature checking for fuzzing efficiency
+            /*
 			if (!res) {
 				g_propagate_error(error, ierror);
 				goto out;
 			}
+            */
 			ibundle->signature_verified = TRUE;
 			ibundle->payload_verified = TRUE;
 		} else {
@@ -1943,6 +1946,7 @@ gboolean check_bundle(const gchar *bundlename, RaucBundle **bundle, CheckBundleP
 				}
 			}
 
+            // Neutralize signature checking for fuzzing efficiency
 			res = cms_verify_sig(ibundle->sigdata, store, &cms, &manifest_bytes, &ierror);
 			if (!res) {
 				g_propagate_error(error, ierror);
